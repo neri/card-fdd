@@ -1,0 +1,67 @@
+[package]
+edition      = "2024"
+name         = "card-fdd"
+rust-version = "1.95"
+version      = "0.1.0"
+
+[[bin]]
+name = "card-fdd"
+path = "./src/bin/main.rs"
+
+[dependencies]
+esp-hal = { version = "~1.2.2", features = ["esp32s3", "log-04", "unstable"] }
+
+esp-rtos = { version = "0.4.0", features = ["embassy", "esp32s3", "log-04"] }
+
+esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32s3", "log-04"] }
+log                    = "0.4.27"
+
+embassy-executor = { version = "0.10.0", features = ["log"] }
+embassy-sync = "0.8.0"
+embassy-time = { version = "0.5.0", features = ["log"] }
+esp-backtrace = { version = "0.20.0", features = [
+  "esp32s3",
+  "panic-handler",
+  "println",
+] }
+esp-println = { version = "0.18.0", features = ["esp32s3", "log-04"] }
+
+critical-section = "1.2.0"
+heapless         = "=0.9.3" # 0.9.4 was released less than a week ago, so pin this version
+static_cell      = "2.1.1"
+
+# LCD (ST7789V2)
+embedded-graphics = "0.8.2"
+embedded-hal      = "1.0.0"
+embedded-hal-bus  = "0.3.0"
+mipidsi           = "0.10.0"
+
+# RGB LED（SK6812）
+esp-hal-smartled = { version = "0.18.0", features = ["esp32s3"] }
+smart-leds-trait = "0.3.2"
+
+# MicroSD + FAT
+embedded-sdmmc = { version = "0.10.0", default-features = false, features = ["log"] }
+
+# USB
+embassy-futures = "0.1.2"
+embassy-usb     = { version = "0.6.0", default-features = false, features = ["log"] }
+# Same as esp-hal's USB OTG driver. Used to access registers directly to discard pending IN data
+embassy-usb-synopsys-otg = { version = "0.4.0", default-features = false }
+
+[features]
+default = []
+# Development: add CDC-ACM to USB (log output, reboot command). Enable with `--features dev-cdc`
+dev-cdc = []
+
+# For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
+[profile.dev]
+# The default debug profile is too slow and too big for resource-constrained devices.
+# Always build with some optimizations enabled.
+opt-level = "s"
+
+[profile.release]
+codegen-units = 1     # LLVM can perform better optimizations using a single thread
+debug         = 2     # prefer slower builds but better debugging experience
+lto           = 'fat'
+opt-level     = 's'
