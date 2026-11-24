@@ -2,7 +2,7 @@
 
 Firmware that turns an M5Stack Cardputer into a USB floppy drive.
 
-Tested on the Cardputer v1.1. Compatibility with other Cardputer revisions is unverified.
+Tested on the Cardputer v1.1 and the Cardputer-Adv. The firmware detects the model at startup, so the same build runs on both. Compatibility with other Cardputer revisions is unverified.
 
 ## Quick start
 
@@ -63,9 +63,12 @@ cargo run --release --features dev-cdc
 
 `cargo run` flashes through [`tools/flash.sh`](tools/flash.sh) and then shows logs (via CDC-ACM in the development build). If the Cardputer is already running card-fdd without CDC-ACM, press `Ctrl+Alt+D` on the device to enter download mode before flashing.
 
+To skip model detection, add `--features board-v1` or `--features board-adv`. Enable only one of them.
+
 ## Known issues
 
 - The default VID/PID (`1209:0001`) is for testing only.
+- The battery level on the screen may jump up and down or read too high, especially while USB is connected.
 
 See [docs/](docs/) (Japanese) for design details.
 

@@ -53,6 +53,9 @@ embassy-usb-synopsys-otg = { version = "0.4.0", default-features = false }
 default = []
 # Development: add CDC-ACM to USB (log output, reboot command). Enable with `--features dev-cdc`
 dev-cdc = []
+# Force the hardware model instead of detecting it at startup (enable at most one)
+board-v1  = []
+board-adv = []
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
 [profile.dev]

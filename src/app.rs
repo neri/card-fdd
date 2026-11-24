@@ -956,7 +956,7 @@ impl App {
                 "volume {} / realistic speed {} / audio underruns {}",
                 sound::volume(),
                 sound::speed_emulation(),
-                crate::board::v1::audio::UNDERRUNS.load(core::sync::atomic::Ordering::Relaxed)
+                crate::board::audio::UNDERRUNS.load(core::sync::atomic::Ordering::Relaxed)
             ),
             "key" => {
                 // Substitute for key input (tab / enter / esc / single character)
@@ -977,6 +977,7 @@ impl App {
                 });
             }
             "cfg" => {
+                info!("board: {}", crate::board::model().name());
                 let mut text: String<{ config::MAX_LEN }> = String::new();
                 self.config.write_to(&mut text);
                 for l in text.lines() {

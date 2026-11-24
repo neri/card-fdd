@@ -29,7 +29,8 @@ M5Stack Cardputer v1.1 を USB フロッピードライブとして動かすフ�
 
 - 1.44MB 以外のフォーマット（720K / 1.2M / 1.25M / 2.88M は判定のみで挿入できない）
 - ヘッダ付きのイメージ形式（.d88 / .fdi / .hdm など）、exFAT の SD、日本語ファイル名の表示
-- SD リーダーモード、Cardputer-Adv、自動消灯（実装したが外した）
+- SD リーダーモード、自動消灯（実装したが外した）
+- Cardputer-Adv は画面表示、SD の操作、全キー、音と音量、USB での読み書き、LED、ダウンロードモードを実機で確認した。電池残量は未確認（[ADV_PLAN.md](ADV_PLAN.md) 10 章）
 
 ---
 
@@ -70,12 +71,15 @@ src/
 ├── input.rs           キー配列、修飾キー、KeyEvent（ハードウェア非依存）
 ├── logger.rs          ログ（UART / USB-Serial-JTAG / CDC）
 ├── board/             ハードウェア層
-│   ├── mod.rs         Keyboard / Battery の trait、ピン表
+│   ├── mod.rs         Keyboard / Battery の trait、機種の判別（Model、detect）、AnyKeyboard、ピン表
+│   ├── audio.rs       I2S + DMA の出力（両機種で共通）
+│   ├── battery.rs     電池電圧の ADC（両機種で共通）
 │   ├── display.rs     ST7789 の初期化
 │   ├── led.rs         RGB LED
 │   ├── sdcard.rs      SD の SPI（速度の切り替え、抜き差し後の再初期化）
 │   ├── system.rs      再起動、ダウンロードモードで再起動
-│   └── v1/            v1.1 固有: keyboard.rs（マトリクス）, battery.rs（ADC）, audio.rs（I2S）
+│   ├── v1/            v1.1 固有: keyboard.rs（マトリクス）
+│   └── adv/           Adv 固有: keyboard.rs（TCA8418）, codec.rs（ES8311 の初期設定）
 ├── storage/           ストレージ層
 │   ├── mod.rs         Disk trait、SharedDisk、DiskError
 │   ├── browser.rs     SD のフォルダ一覧（embedded-sdmmc）、ルートのファイルの読み書き、ファイルの作成
@@ -264,7 +268,7 @@ CBW（31 バイト、署名 USBC）を受け、データフェーズのあと CS
 
 ### 5.7 開発用 CDC-ACM（feature `dev-cdc`、既定では無効）
 
-- ログを送る。ポートが閉じている間（DTR が落ちている間）は送らず、送信が 1 秒終わらなければ接続待ちからやり直す
+- ログを送る。ポートが閉じている間（DTR が落ちている間）は送らずにパイプ（4KB）にためておき、DTR が 300ms 続けて立ってから送る（ModemManager などが一瞬だけ開いたときに起動ログを取られないように）。パイプがいっぱいになると新しい行を捨てるので、起動直後のログは最初にポートを開いた側に届く。送信が 1 秒終わらなければ接続待ちからやり直す
 - 1 行のコマンドを受ける。`download`（ダウンロードモードで再起動）、`reboot` は CDC タスクが処理し、それ以外は UI に渡す
 - UI が処理するコマンド: `ls`、`insert <名前>`、`eject`、`wp on|off`、`newimg`、`stats`（USB の診断）、`snd`（音の状態）、`cfg`（設定の表示）、`key tab|enter|esc|<1 文字>`（キー入力の代わり）
 - ホストの端末がログを送り返してくることがあるので、`[` で始まる行は無視し、200ms 以上途切れたら書きかけの行を捨てる

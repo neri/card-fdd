@@ -1,4 +1,7 @@
-//! v1.1 speaker: NS4168 (I2S amplifier). BCLK G41, LRCK G43, DATA G42.
+//! Audio output over I2S. BCLK G41, LRCK G43, DATA G42 on both models.
+//!
+//! v1.1 feeds an NS4168 I2S amplifier, which needs no setup. Adv feeds an ES8311 codec, which must be
+//! configured over I2C before this starts ([`crate::board::adv::codec`]).
 //!
 //! Streams 16kHz 16-bit stereo (same sound on both channels) continuously via DMA. Plays silence when idle.
 //!

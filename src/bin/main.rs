@@ -13,10 +13,10 @@ use card_fdd::app::{App, SdImage, SharedSd};
 use card_fdd::board::display::{self, DisplayPins};
 use card_fdd::board::led::StatusLed;
 use card_fdd::board::sdcard::{self, SdPins};
+use card_fdd::board::audio::{self, AudioPins};
+use card_fdd::board::v1::MatrixKeyboard;
 use card_fdd::board::v1::keyboard::KeyboardPins;
-use card_fdd::board::v1::audio::{self, AudioPins};
-use card_fdd::board::v1::{AdcBattery, MatrixKeyboard};
-use card_fdd::board::{Battery, Keyboard};
+use card_fdd::board::{self, AdcBattery, AnyKeyboard, Battery, Keyboard, Model, adv};
 use card_fdd::config::{Config, Defaults};
 use card_fdd::input::KeyEvent;
 use card_fdd::logger;
@@ -69,7 +69,7 @@ const IDENTITY: Identity = Identity {
 };
 
 #[embassy_executor::task]
-async fn keyboard_task(mut keyboard: MatrixKeyboard) {
+async fn keyboard_task(mut keyboard: AnyKeyboard) {
     loop {
         let event = keyboard.next_event().await;
         KEY_EVENTS.send(event).await;
@@ -155,18 +155,34 @@ async fn main(spawner: Spawner) -> ! {
     });
     let led = StatusLed::new(p.RMT, p.GPIO21);
     let mut battery = AdcBattery::new(p.ADC1, p.GPIO10);
-    let keyboard = MatrixKeyboard::new(KeyboardPins {
-        a0: p.GPIO8,
-        a1: p.GPIO9,
-        a2: p.GPIO11,
-        in0: p.GPIO13,
-        in1: p.GPIO15,
-        in2: p.GPIO3,
-        in3: p.GPIO4,
-        in4: p.GPIO5,
-        in5: p.GPIO6,
-        in6: p.GPIO7,
-    });
+
+    // Detect the model before touching the keyboard pins (G8 / G9 / G11 differ between models)
+    let (mut i2c0, mut gpio8, mut gpio9) = (p.I2C0, p.GPIO8, p.GPIO9);
+    let model = board::detect(i2c0.reborrow(), gpio8.reborrow(), gpio9.reborrow());
+    board::set_model(model);
+    info!("Board: {}", model.name());
+    let keyboard = match model {
+        Model::V1 => AnyKeyboard::V1(MatrixKeyboard::new(KeyboardPins {
+            a0: gpio8,
+            a1: gpio9,
+            a2: p.GPIO11,
+            in0: p.GPIO13,
+            in1: p.GPIO15,
+            in2: p.GPIO3,
+            in3: p.GPIO4,
+            in4: p.GPIO5,
+            in5: p.GPIO6,
+            in6: p.GPIO7,
+        })),
+        Model::Adv => {
+            let mut bus = adv::i2c_bus(i2c0, gpio8, gpio9);
+            // The codec must be configured before audio starts; the bus then belongs to the keyboard
+            if let Err(e) = adv::codec::init(&mut bus) {
+                log::warn!("ES8311 init failed: {:?}", e);
+            }
+            AnyKeyboard::Adv(adv::Tca8418Keyboard::new(bus, p.GPIO11))
+        }
+    };
     spawner.spawn(keyboard_task(keyboard).expect("Failed to spawn keyboard_task"));
     spawner.spawn(
         sound_task(AudioPins {

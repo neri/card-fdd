@@ -1,4 +1,4 @@
-//! v1.1 battery voltage: fed to G10 (ADC1) through a 1/2 voltage divider.
+//! Battery voltage: fed to G10 (ADC1) through a 1/2 voltage divider (100k + 100k on both v1.1 and Adv).
 
 use esp_hal::Blocking;
 use esp_hal::analog::adc::{Adc, AdcCalCurve, AdcConfig, AdcPin, Attenuation};

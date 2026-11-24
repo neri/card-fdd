@@ -9,7 +9,7 @@
 use embassy_futures::join::join;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
-use embassy_time::{Duration, with_timeout};
+use embassy_time::{Duration, Instant, Timer, with_timeout};
 use embassy_usb::class::cdc_acm::{CdcAcmClass, Receiver, Sender};
 use heapless::Vec;
 
@@ -32,20 +32,54 @@ async fn send_logs(mut tx: Sender<'static, UsbDriver>) {
     const WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
     let mut buf = [0u8; 64];
+    // Bytes taken from the pipe but not sent yet
+    let mut len = 0;
     loop {
+        // `wait_connection` only waits for the endpoint to be enabled (USB configured), not for
+        // the port to be opened. Logs stay in the pipe until a reader opens the port, so the boot
+        // log (written before USB starts) reaches the first reader. Once the pipe is full, newer
+        // lines are dropped instead
         tx.wait_connection().await;
+        wait_open(&tx).await;
         loop {
-            let n = LOG_PIPE.read(&mut buf).await;
+            if len == 0 {
+                len = LOG_PIPE.read(&mut buf).await;
+            }
             // Don't send if the port is closed (ModemManager etc. may open and close it briefly,
-            // and data left half-sent would block all subsequent logs)
+            // and data left half-sent would block all subsequent logs). Keep the bytes for the next reader
             if !tx.dtr() {
                 break;
             }
-            match with_timeout(WRITE_TIMEOUT, tx.write_packet(&buf[..n])).await {
+            let result = with_timeout(WRITE_TIMEOUT, tx.write_packet(&buf[..len])).await;
+            // On a timeout the packet may still be queued in the endpoint, so don't send it again
+            len = 0;
+            match result {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) | Err(_) => break,
             }
         }
+    }
+}
+
+/// Wait until the host has kept the port open (DTR asserted) for a while.
+///
+/// Right after enumeration, ModemManager etc. open the port briefly and close it again. Waiting out
+/// such a probe keeps it from swallowing the boot log.
+async fn wait_open(tx: &Sender<'static, UsbDriver>) {
+    const POLL: Duration = Duration::from_millis(20);
+    const SETTLE: Duration = Duration::from_millis(300);
+
+    let mut open_since: Option<Instant> = None;
+    loop {
+        if tx.dtr() {
+            let since = *open_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= SETTLE {
+                return;
+            }
+        } else {
+            open_since = None;
+        }
+        Timer::after(POLL).await;
     }
 }
 
