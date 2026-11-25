@@ -56,6 +56,10 @@ const CREATE_BLOCKS_PER_TICK: u32 = 8;
 const CREATE_YIELD_TO_USB: Duration = Duration::from_millis(200);
 /// Number of blocks in a blank image (1.44MB).
 const BLANK_BLOCKS: u32 = 2880;
+/// Interval for checking whether the SD card is still there (or has been inserted).
+const CARD_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// Polls that must find a newly inserted card before it is mounted (lets the contacts settle).
+const CARD_INSERT_POLLS: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
@@ -108,6 +112,17 @@ pub struct App {
     creating: Option<Creating>,
     /// SD reader mode was requested; reboot into it once no transfer is running.
     reader_requested: bool,
+    /// The previous image may still be inserted automatically. Only the first mount after boot does
+    /// that; after the card is removed, its contents may have changed, so the user picks again.
+    boot_insert: bool,
+    last_card_poll: Instant,
+    /// A card was there at the last poll or mount attempt. A card that failed to mount is not retried
+    /// automatically until it is removed and inserted again.
+    card_present: bool,
+    /// Consecutive polls that found a newly inserted card.
+    card_seen: u8,
+    /// CID of the mounted card, to notice a swap between polls.
+    card_cid: Option<sdcard::Cid>,
 }
 
 impl App {
@@ -144,6 +159,11 @@ impl App {
             link: LinkState::Detached,
             creating: None,
             reader_requested: false,
+            boot_insert: true,
+            last_card_poll: Instant::MIN,
+            card_present: false,
+            card_seen: 0,
+            card_cid: None,
         }
     }
 
@@ -202,12 +222,16 @@ impl App {
             let r = sd.go_to(&self.config.image_dir);
             if r.is_ok() {
                 sd.device(|card| sdcard::speed_up(card));
+                self.card_cid = sd.device(|card| sdcard::read_cid(card));
             }
             r
         };
         self.led.off();
 
         self.card_ok = result.is_ok();
+        self.card_present = true;
+        self.card_seen = 0;
+        self.last_card_poll = Instant::now();
         self.selector.reset();
         self.image.borrow_mut().set_wp_switch(self.config.write_protect);
         sound::set_volume(self.config.volume);
@@ -228,8 +252,16 @@ impl App {
     }
 
     /// Insert the previous image (when auto_mount is enabled in the settings).
+    ///
+    /// Only for the first mount after boot (also when the card is inserted later). After a card
+    /// removal nothing is inserted, because the image may have been changed elsewhere.
     pub fn auto_insert(&mut self) {
-        if !self.card_ok || !self.config.auto_mount || self.config.last_image.is_empty() {
+        if !self.card_ok || !self.boot_insert {
+            self.redraw();
+            return;
+        }
+        self.boot_insert = false;
+        if !self.config.auto_mount || self.config.last_image.is_empty() {
             self.redraw();
             return;
         }
@@ -383,6 +415,7 @@ impl App {
     pub fn tick(&mut self) {
         usb::sense_trace::sample();
         self.poll_drive();
+        self.poll_card();
         self.poll_activity();
         self.poll_link();
         self.step_create();
@@ -425,6 +458,65 @@ impl App {
             self.force_eject_armed = None;
             self.redraw();
         }
+    }
+
+    /// Notice SD card removal and insertion by probing the card (it has no card-detect pin).
+    ///
+    /// Removal ejects the image, so the host sees the medium go away. A newly inserted card is
+    /// mounted, but no image is inserted: the user picks one again. Runs only between USB transfers.
+    fn poll_card(&mut self) {
+        if self.last_card_poll.elapsed() < CARD_POLL_INTERVAL
+            || usb::HOST.is_busy()
+            || self.creating.is_some()
+            || self.pending_media_change.is_some()
+            || self.reader_requested
+        {
+            return;
+        }
+        self.last_card_poll = Instant::now();
+
+        if self.card_ok {
+            if !self.card_still_there() {
+                info!("SD card removed");
+                self.card_present = false;
+                self.card_failed(StorageError::NoCard);
+            }
+            return;
+        }
+
+        if !self.sd.borrow_mut().device(|card| sdcard::probe(card)) {
+            self.card_present = false;
+            self.card_seen = 0;
+            return;
+        }
+        if self.card_present {
+            // Still the card that failed to mount (Enter retries)
+            return;
+        }
+        self.card_seen += 1;
+        if self.card_seen < CARD_INSERT_POLLS {
+            return;
+        }
+        info!("SD card inserted");
+        self.mount_card();
+        self.auto_insert();
+    }
+
+    /// Whether the mounted card still answers and is the same card. Tries twice before giving up.
+    fn card_still_there(&mut self) -> bool {
+        for attempt in 0..2 {
+            if attempt > 0 {
+                esp_hal::delay::Delay::new().delay_millis(2);
+            }
+            if let Some(cid) = self.sd.borrow_mut().device(|card| sdcard::read_cid(card)) {
+                let same = self.card_cid.is_none_or(|c| c == cid);
+                if !same {
+                    info!("SD card was swapped");
+                }
+                return same;
+            }
+        }
+        false
     }
 
     /// USB access lamp and access position display.
