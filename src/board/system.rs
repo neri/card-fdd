@@ -1,11 +1,35 @@
-//! Reboot.
+//! Reboot, and the boot mode flag carried across a reboot.
 
 use esp_hal::peripherals::{LPWR, USB_DEVICE, USB_WRAP};
+
+/// Value placed in `RTC_CNTL_STORE0` to boot into SD reader mode ("SDRD").
+///
+/// STORE0 is a "reserved" general-purpose register that neither esp-hal nor the ESP-IDF bootloader uses
+/// (STORE1-7 hold the clock calibration, boot time, XTAL/APB frequency, wake entry and RTC memory CRC).
+/// It survives a software reset and is cleared by a power-on reset, so turning the power off always
+/// returns to the normal (floppy) mode.
+const READER_MAGIC: u32 = 0x5344_5244;
+
+/// Whether this boot should run SD reader mode. Clears the flag, so the next reboot returns to normal mode.
+pub fn take_reader_request() -> bool {
+    let regs = LPWR::regs();
+    let value = regs.store0().read().bits();
+    // SAFETY: STORE0 is a plain 32-bit general-purpose register with no side effects.
+    regs.store0().write(|w| unsafe { w.bits(0) });
+    value == READER_MAGIC
+}
 
 /// Normal reboot.
 pub fn reboot() -> ! {
     restore_usb_serial_jtag();
     esp_hal::system::software_reset()
+}
+
+/// Reboot into SD reader mode (the whole card is exposed over USB). Only that one boot runs it.
+pub fn reboot_to_reader() -> ! {
+    // SAFETY: STORE0 is a plain 32-bit general-purpose register with no side effects.
+    LPWR::regs().store0().write(|w| unsafe { w.bits(READER_MAGIC) });
+    reboot()
 }
 
 /// Reboot into download mode (the ROM's serial flashing mode).

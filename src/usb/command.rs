@@ -8,7 +8,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use crate::storage::Disk;
+use crate::storage::{Capacity, Disk};
 use crate::storage::geometry::{self, Geometry};
 
 /// Command set.
@@ -599,7 +599,12 @@ impl Processor {
         Outcome::failed()
     }
 
-    fn require_medium(&self, disk: &impl Disk) -> Result<Geometry, Sense> {
+    fn require_medium(&self, disk: &impl Disk) -> Result<Capacity, Sense> {
+        disk.capacity().ok_or(Sense::NOT_READY_NO_MEDIUM)
+    }
+
+    /// Floppy geometry of the medium (for FORMAT UNIT).
+    fn require_geometry(&self, disk: &impl Disk) -> Result<Geometry, Sense> {
         disk.geometry().ok_or(Sense::NOT_READY_NO_MEDIUM)
     }
 
@@ -638,9 +643,9 @@ impl Processor {
     }
 
     fn read_capacity(&self, buf: &mut [u8], disk: &impl Disk) -> Result<DataPhase, Sense> {
-        let g = self.require_medium(disk)?;
-        buf[0..4].copy_from_slice(&(g.total_sectors() - 1).to_be_bytes());
-        buf[4..8].copy_from_slice(&u32::from(g.bytes_per_sector).to_be_bytes());
+        let c = self.require_medium(disk)?;
+        buf[0..4].copy_from_slice(&c.blocks.saturating_sub(1).to_be_bytes());
+        buf[4..8].copy_from_slice(&u32::from(c.block_size).to_be_bytes());
         Ok(DataPhase::In(8))
     }
 
@@ -654,13 +659,13 @@ impl Processor {
             len += 8;
         };
         buf[..4].fill(0);
-        match disk.geometry() {
-            Some(g) => {
+        match disk.capacity() {
+            Some(c) => {
                 // Current capacity (formatted)
-                put(buf, g.total_sectors(), 0b10, g.bytes_per_sector);
+                put(buf, c.blocks, 0b10, c.block_size);
                 if self.set == CommandSet::Ufi {
                     // Formattable capacities (currently only one, the same as the current medium)
-                    put(buf, g.total_sectors(), 0, g.bytes_per_sector);
+                    put(buf, c.blocks, 0, c.block_size);
                 }
             }
             None => put(buf, DRIVE_MAX.total_sectors(), 0b11, DRIVE_MAX.bytes_per_sector),
@@ -718,8 +723,8 @@ impl Processor {
     }
 
     fn rw(&self, write: bool, lba: u32, blocks: u32, disk: &impl Disk) -> Result<DataPhase, Sense> {
-        let g = self.require_medium(disk)?;
-        if u64::from(lba) + u64::from(blocks) > u64::from(g.total_sectors()) {
+        let c = self.require_medium(disk)?;
+        if u64::from(lba) + u64::from(blocks) > u64::from(c.blocks) {
             return Err(Sense::LBA_OUT_OF_RANGE);
         }
         if write {
@@ -754,7 +759,7 @@ impl Processor {
         scratch: &mut [u8],
         disk: &mut impl Disk,
     ) -> Result<(), Sense> {
-        let g = self.require_medium(disk)?;
+        let g = self.require_geometry(disk)?;
         if data.len() < 12 || cb.len() < 3 {
             return Err(Sense::INVALID_FIELD);
         }

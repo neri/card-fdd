@@ -16,14 +16,16 @@ use card_fdd::board::sdcard::{self, SdPins};
 use card_fdd::board::audio::{self, AudioPins};
 use card_fdd::board::v1::MatrixKeyboard;
 use card_fdd::board::v1::keyboard::KeyboardPins;
-use card_fdd::board::{self, AdcBattery, AnyKeyboard, Battery, Keyboard, Model, adv};
+use card_fdd::board::{self, AdcBattery, AnyKeyboard, Battery, Keyboard, Model, adv, system};
 use card_fdd::config::{Config, Defaults};
 use card_fdd::input::KeyEvent;
 use card_fdd::logger;
+use card_fdd::reader::{Reader, SdReader};
 use card_fdd::sound::{self, synth::Synth};
 use card_fdd::storage::SharedDisk;
 use card_fdd::storage::browser::Browser;
 use card_fdd::storage::image::ImageDisk;
+use card_fdd::storage::reader::ReaderDisk;
 use card_fdd::usb::command::{Identity, Processor};
 use card_fdd::usb::{self, MassStorage, UsbDriver, UsbIdentity, UsbMode};
 use embassy_executor::Spawner;
@@ -32,6 +34,8 @@ use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Instant, with_timeout};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
+use esp_hal::gpio::Output;
+use esp_hal::peripherals::{GPIO19, GPIO20, USB_FS};
 use esp_hal::timer::timg::TimerGroup;
 use heapless::String;
 use log::info;
@@ -65,6 +69,13 @@ fn config_defaults() -> Config {
 const IDENTITY: Identity = Identity {
     vendor: *b"CARDFDD ",
     product: *b"USB Floppy      ",
+    revision: *b"0.1 ",
+};
+
+/// INQUIRY names in SD reader mode.
+const READER_IDENTITY: Identity = Identity {
+    vendor: *b"CARDFDD ",
+    product: *b"SD Reader       ",
     revision: *b"0.1 ",
 };
 
@@ -111,6 +122,20 @@ async fn msc_task(
     msc.run(processor, &mut disk).await
 }
 
+#[allow(
+    clippy::large_stack_frames,
+    reason = "About 1-1.5KB for USB transfer packet buffers etc. The main stack has plenty of headroom"
+)]
+#[embassy_executor::task]
+async fn reader_msc_task(
+    msc: &'static mut MassStorage,
+    processor: &'static mut Processor,
+    disk: &'static RefCell<SdReader>,
+) {
+    let mut disk = SharedDisk(disk);
+    msc.run(processor, &mut disk).await
+}
+
 #[cfg(feature = "dev-cdc")]
 #[allow(
     clippy::large_stack_frames,
@@ -119,6 +144,102 @@ async fn msc_task(
 #[embassy_executor::task]
 async fn cdc_task(class: embassy_usb::class::cdc_acm::CdcAcmClass<'static, UsbDriver>) {
     usb::cdc::run(class).await
+}
+
+struct UsbPins {
+    usb: USB_FS<'static>,
+    dp: GPIO20<'static>,
+    dm: GPIO19<'static>,
+}
+
+/// Build the USB device and start its tasks except mass storage, which the caller starts with
+/// the returned transport and processor (its task depends on the disk type).
+#[allow(
+    clippy::large_stack_frames,
+    reason = "Moves the USB parts into statics once at startup on the main stack, as main did before"
+)]
+fn start_usb(
+    spawner: Spawner,
+    pins: UsbPins,
+    mode: UsbMode,
+    identity: &UsbIdentity,
+    inquiry: Identity,
+) -> (&'static mut MassStorage, &'static mut Processor) {
+    info!(
+        "Starting USB ({:?}, {:04x}:{:04x}). Further logs go to CDC-ACM and UART",
+        mode, identity.vid, identity.pid
+    );
+    logger::disable_jtag();
+    let parts = usb::build(pins.usb, pins.dp, pins.dm, mode, identity);
+    static USB_DEVICE: StaticCell<embassy_usb::UsbDevice<'static, UsbDriver>> = StaticCell::new();
+    static MSC: StaticCell<MassStorage> = StaticCell::new();
+    static PROCESSOR: StaticCell<Processor> = StaticCell::new();
+    let device = USB_DEVICE.init(parts.device);
+    let msc = MSC.init(parts.msc);
+    let processor = PROCESSOR.init(Processor::new(mode.command_set(), inquiry, &usb::HOST));
+    spawner.spawn(usb_device_task(device).expect("Failed to spawn usb_device_task"));
+    #[cfg(feature = "dev-cdc")]
+    spawner.spawn(cdc_task(parts.cdc).expect("Failed to spawn cdc_task"));
+    (msc, processor)
+}
+
+/// SD reader mode: expose the whole card over USB until Esc reboots back to the normal mode.
+///
+/// The file system is never opened (no config file, no listing), so nothing on the device side
+/// can disagree with what the host writes.
+#[allow(
+    clippy::large_stack_frames,
+    reason = "Runs on the main stack in place of the normal main loop and moves its state into statics"
+)]
+async fn run_reader(
+    spawner: Spawner,
+    card: sdcard::Card,
+    usb_pins: UsbPins,
+    lcd: display::Display,
+    backlight: Output<'static>,
+    led: StatusLed,
+    mut battery: AdcBattery,
+) -> ! {
+    // Initializes the card (at the slow clock), then the clock can go up
+    let blocks = match card.num_bytes() {
+        Ok(bytes) => {
+            sdcard::speed_up(&card);
+            Some((bytes / 512).min(u64::from(u32::MAX)) as u32)
+        }
+        Err(e) => {
+            log::warn!("Cannot read the SD card: {:?}", e);
+            None
+        }
+    };
+    info!("SD reader mode: {:?} blocks", blocks);
+    static DISK: StaticCell<RefCell<SdReader>> = StaticCell::new();
+    let disk: &'static RefCell<SdReader> = DISK.init(RefCell::new(ReaderDisk::new(card, blocks)));
+
+    static READER: StaticCell<Reader> = StaticCell::new();
+    let reader = READER.init(Reader::new(lcd, backlight, led, disk));
+    reader.set_battery(battery.percent());
+
+    // Started even without a card: the host then sees an empty drive, and Esc still leaves
+    let (msc, processor) = start_usb(spawner, usb_pins, UsbMode::ScsiBot, &UsbIdentity::READER, READER_IDENTITY);
+    spawner.spawn(reader_msc_task(msc, processor, disk).expect("Failed to spawn reader_msc_task"));
+
+    let mut last_battery = Instant::now();
+    loop {
+        if let Ok(event) = with_timeout(Duration::from_millis(20), KEY_EVENTS.receive()).await
+            && event.pressed
+        {
+            reader.on_key(&event);
+        }
+        #[cfg(feature = "dev-cdc")]
+        if let Ok(cmd) = usb::cdc::DEV_COMMANDS.try_receive() {
+            reader.dev_command(&cmd);
+        }
+        reader.tick();
+        if last_battery.elapsed() >= Duration::from_secs(5) {
+            last_battery = Instant::now();
+            reader.set_battery(battery.percent());
+        }
+    }
 }
 
 /// Turn a config string into a 'static string usable in USB descriptors.
@@ -143,6 +264,8 @@ async fn main(spawner: Spawner) -> ! {
     esp_rtos::start(timg0.timer0, p.FROM_CPU_INTR0);
 
     info!("card-fdd {} starting", env!("CARGO_PKG_VERSION"));
+    // Read (and clear) the boot mode flag first, so any reset from here on returns to the normal mode
+    let reader_mode = system::take_reader_request();
 
     let (lcd, backlight) = display::init(DisplayPins {
         spi: p.SPI2,
@@ -202,6 +325,14 @@ async fn main(spawner: Spawner) -> ! {
         mosi: p.GPIO14,
         cs: p.GPIO12,
     });
+    let usb_pins = UsbPins {
+        usb: p.USB_FS,
+        dp: p.GPIO20,
+        dm: p.GPIO19,
+    };
+    if reader_mode {
+        run_reader(spawner, card, usb_pins, lcd, backlight, led, battery).await;
+    }
     // Holds the listing (up to 128 entries), so it lives in a static. Shared by the UI and USB
     static SD: StaticCell<SharedSd> = StaticCell::new();
     let sd: &'static SharedSd = SD.init(RefCell::new(Browser::new(card)));
@@ -229,22 +360,8 @@ async fn main(spawner: Spawner) -> ! {
         product: leak_str(&PRODUCT, &app.config.usb_product),
         ..UsbIdentity::DEFAULT
     };
-    info!(
-        "Starting USB ({:?}, {:04x}:{:04x}). Further logs go to CDC-ACM and UART",
-        usb_mode, identity.vid, identity.pid
-    );
-    logger::disable_jtag();
-    let parts = usb::build(p.USB_FS, p.GPIO20, p.GPIO19, usb_mode, &identity);
-    static USB_DEVICE: StaticCell<embassy_usb::UsbDevice<'static, UsbDriver>> = StaticCell::new();
-    static MSC: StaticCell<MassStorage> = StaticCell::new();
-    static PROCESSOR: StaticCell<Processor> = StaticCell::new();
-    let device = USB_DEVICE.init(parts.device);
-    let msc = MSC.init(parts.msc);
-    let processor = PROCESSOR.init(Processor::new(usb_mode.command_set(), IDENTITY, &usb::HOST));
-    spawner.spawn(usb_device_task(device).expect("Failed to spawn usb_device_task"));
+    let (msc, processor) = start_usb(spawner, usb_pins, usb_mode, &identity, IDENTITY);
     spawner.spawn(msc_task(msc, processor, image).expect("Failed to spawn msc_task"));
-    #[cfg(feature = "dev-cdc")]
-    spawner.spawn(cdc_task(parts.cdc).expect("Failed to spawn cdc_task"));
 
     // Insert the previous image
     app.auto_insert();

@@ -8,8 +8,10 @@ use embassy_usb::driver::{Driver, EndpointError, EndpointIn, EndpointOut};
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use embassy_time::{Instant, Timer};
+use static_cell::ConstStaticCell;
 
 use super::command::{DataPhase, Expected, Outcome, Processor};
+use super::perf::{PERF, now_us};
 use super::{Activity, notify_activity};
 use crate::sound;
 use crate::storage::Disk;
@@ -18,8 +20,12 @@ use crate::storage::geometry::Geometry;
 /// Full Speed bulk packet size.
 pub const MAX_PACKET: usize = 64;
 
-/// Work buffer for one sector (up to 1024 bytes) + parameters.
-const BUF_LEN: usize = 1024 + 64;
+/// Largest read / write chunk [bytes]: 8 blocks of 512 bytes (multi-block reads and writes,
+/// [`Disk::max_read_blocks`] / [`Disk::max_write_blocks`]). Also covers one 1024-byte floppy sector.
+const CHUNK_LEN: usize = 4096;
+
+/// Work buffer for one chunk + parameters.
+const BUF_LEN: usize = CHUNK_LEN + 64;
 
 /// Result of the data phase of one command.
 pub struct Transferred {
@@ -33,15 +39,18 @@ pub struct Transferred {
 pub struct DataPipe<'d, D: Driver<'d>> {
     pub ep_in: D::EndpointIn,
     pub ep_out: D::EndpointOut,
-    buf: [u8; BUF_LEN],
+    buf: &'static mut [u8; BUF_LEN],
 }
 
 impl<'d, D: Driver<'d>> DataPipe<'d, D> {
+    /// Call only once (there is one mass storage interface).
     pub fn new(ep_in: D::EndpointIn, ep_out: D::EndpointOut) -> Self {
+        // In a static so the 4KB buffer never travels on the stack with the transport
+        static BUF: ConstStaticCell<[u8; BUF_LEN]> = ConstStaticCell::new([0; BUF_LEN]);
         Self {
             ep_in,
             ep_out,
-            buf: [0; BUF_LEN],
+            buf: BUF.take(),
         }
     }
 
@@ -62,7 +71,7 @@ impl<'d, D: Driver<'d>> DataPipe<'d, D> {
 
     /// Process the command before starting endpoint I/O, so CBI can still stall its ADSC.
     pub(super) fn prepare(&mut self, processor: &mut Processor, disk: &mut impl Disk, cb: &[u8]) -> Outcome {
-        processor.command(cb, &mut self.buf, disk)
+        processor.command(cb, &mut self.buf[..], disk)
     }
 
     pub(super) async fn execute_prepared(
@@ -135,19 +144,39 @@ impl<'d, D: Driver<'d>> DataPipe<'d, D> {
                     let bs = block_size(disk);
                     notify_activity(Activity { lba, write: false });
                     let geometry = disk.geometry();
-                    for i in 0..blocks {
-                        if done + bs > host_len {
+                    // Sectors per read: as many as the disk reads efficiently at once and the buffer holds
+                    let per_read = disk.max_read_blocks().clamp(1, (CHUNK_LEN / bs).max(1) as u32);
+                    let (mut sd_us, mut usb_us, mut count) = (0u32, 0u32, 0u32);
+                    while count < blocks {
+                        let room = ((host_len - done) / bs) as u32;
+                        let n = per_read.min(blocks - count).min(room);
+                        if n == 0 {
                             break;
                         }
-                        mechanics(geometry, lba + i, false).await;
-                        if let Err(e) = disk.read(lba + i, &mut self.buf[..bs]) {
+                        let first = lba + count;
+                        for k in 0..n {
+                            mechanics(geometry, first + k, false).await;
+                        }
+                        let len = n as usize * bs;
+                        let t0 = now_us();
+                        let result = if n == 1 {
+                            disk.read(first, &mut self.buf[..len])
+                        } else {
+                            disk.read_blocks(first, &mut self.buf[..len], bs)
+                        };
+                        if let Err(e) = result {
                             processor.transfer_failed(e);
                             ok = false;
                             break;
                         }
-                        send(&mut self.ep_in, &self.buf[..bs]).await?;
-                        done += bs;
+                        let t1 = now_us();
+                        send(&mut self.ep_in, &self.buf[..len]).await?;
+                        sd_us = sd_us.wrapping_add(t1.wrapping_sub(t0));
+                        usb_us = usb_us.wrapping_add(now_us().wrapping_sub(t1));
+                        count += n;
+                        done += len;
                     }
+                    PERF.read.record(count, sd_us, usb_us);
                 }
             }
             DataPhase::Write { lba, blocks } => {
@@ -155,26 +184,55 @@ impl<'d, D: Driver<'d>> DataPipe<'d, D> {
                     let bs = block_size(disk);
                     notify_activity(Activity { lba, write: true });
                     let geometry = disk.geometry();
-                    for i in 0..blocks {
-                        if done + bs > host_len {
+                    // Sectors per write: as many as the disk writes efficiently at once and the buffer holds
+                    let per_write = disk.max_write_blocks().clamp(1, (CHUNK_LEN / bs).max(1) as u32);
+                    let (mut sd_us, mut usb_us, mut count) = (0u32, 0u32, 0u32);
+                    let mut next = 0u32;
+                    while next < blocks {
+                        let room = ((host_len - done) / bs) as u32;
+                        let n = per_write.min(blocks - next).min(room);
+                        if n == 0 {
                             processor.incomplete_data_out(cb[0]);
                             ok = false;
                             break;
                         }
-                        let received = recv(&mut self.ep_out, &mut self.buf[..bs]).await?;
+                        let first = lba + next;
+                        let len = n as usize * bs;
+                        let t0 = now_us();
+                        let received = recv(&mut self.ep_out, &mut self.buf[..len]).await?;
+                        usb_us = usb_us.wrapping_add(now_us().wrapping_sub(t0));
                         done = (done + received.bytes).min(host_len);
-                        if received.bytes != bs {
+                        // Write the whole sectors that arrived, even if the host stopped short
+                        let whole = (received.bytes.min(len) / bs) as u32;
+                        for k in 0..whole {
+                            mechanics(geometry, first + k, true).await;
+                        }
+                        if ok && whole > 0 {
+                            let wlen = whole as usize * bs;
+                            let t1 = now_us();
+                            let result = if whole == 1 {
+                                disk.write(first, &self.buf[..wlen])
+                            } else {
+                                disk.write_blocks(first, &self.buf[..wlen], bs)
+                            };
+                            match result {
+                                Ok(()) => count += whole,
+                                Err(e) => {
+                                    processor.transfer_failed(e);
+                                    ok = false;
+                                }
+                            }
+                            sd_us = sd_us.wrapping_add(now_us().wrapping_sub(t1));
+                        }
+                        if received.bytes != len {
                             processor.incomplete_data_out(cb[0]);
                             ok = false;
                             out_ended = received.short;
                             break;
                         }
-                        mechanics(geometry, lba + i, true).await;
-                        if ok && let Err(e) = disk.write(lba + i, &self.buf[..bs]) {
-                            processor.transfer_failed(e);
-                            ok = false;
-                        }
+                        next += n;
                     }
+                    PERF.write.record(count, sd_us, usb_us);
                 } else if blocks != 0 {
                     processor.incomplete_data_out(cb[0]);
                     ok = false;
@@ -240,7 +298,7 @@ async fn mechanics(geometry: Option<Geometry>, lba: u32, write: bool) {
 }
 
 pub fn block_size(disk: &impl Disk) -> usize {
-    disk.geometry().map_or(512, |g| usize::from(g.bytes_per_sector))
+    disk.capacity().map_or(512, |c| usize::from(c.block_size))
 }
 
 /// Send `data` split into packets.

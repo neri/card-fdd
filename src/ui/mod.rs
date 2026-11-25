@@ -12,6 +12,7 @@ use embedded_graphics::text::Text;
 
 use crate::board::display::{self, Display};
 
+pub mod reader;
 pub mod selector;
 pub mod status;
 

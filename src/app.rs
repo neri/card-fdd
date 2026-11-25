@@ -106,6 +106,8 @@ pub struct App {
     led_on: bool,
     link: LinkState,
     creating: Option<Creating>,
+    /// SD reader mode was requested; reboot into it once no transfer is running.
+    reader_requested: bool,
 }
 
 impl App {
@@ -141,6 +143,7 @@ impl App {
             led_on: false,
             link: LinkState::Detached,
             creating: None,
+            reader_requested: false,
         }
     }
 
@@ -390,6 +393,9 @@ impl App {
 
     /// Handle queued media changes and eject requests once no transfer can touch the disk.
     fn poll_drive(&mut self) {
+        if self.reader_requested && !usb::HOST.is_busy() {
+            Self::enter_reader_now();
+        }
         if !usb::HOST.is_busy() {
             let io_error = self.image.borrow_mut().take_io_error();
             let host_eject = usb::HOST.take_eject_request();
@@ -492,6 +498,9 @@ impl App {
                     info!("Rebooting");
                     system::reboot();
                 }
+                // Ctrl + Alt + S forms a rectangle in the key matrix (no diodes), so the scan also sees
+                // a phantom Shift and the key arrives as 'S'. Accept both cases
+                Key::Char('s' | 'S') => self.enter_reader(),
                 _ => {}
             }
             return;
@@ -737,6 +746,39 @@ impl App {
         self.redraw();
     }
 
+    /// Ctrl+Alt+S: reboot into SD reader mode (the whole card is exposed over USB).
+    ///
+    /// Nothing needs writing first: floppy writes go straight to the card and an inserted image never
+    /// changes the FAT, so the reboot just drops it. The config keeps the last image, so it is inserted
+    /// again after coming back. If the host prevents removal of the inserted floppy, warn first;
+    /// pressing again within the window goes anyway. Not while a blank image is being written.
+    fn enter_reader(&mut self) {
+        if self.reader_requested || self.creating.is_some() {
+            return;
+        }
+        let armed = self
+            .force_eject_armed
+            .take()
+            .is_some_and(|t| t.elapsed() < FORCE_EJECT_WINDOW);
+        if self.image.borrow().mounted().is_some() && usb::HOST.prevent_removal() && !armed {
+            info!("Host is preventing medium removal");
+            self.force_eject_armed = Some(Instant::now());
+            self.footer("PC is using it! Ctrl+Alt+S again: force", color::ERROR);
+            return;
+        }
+        self.footer("Starting SD reader mode...", color::ACCENT);
+        // A read/write in progress finishes first (poll_drive reboots once it is done)
+        self.reader_requested = true;
+        if !usb::HOST.is_busy() {
+            Self::enter_reader_now();
+        }
+    }
+
+    fn enter_reader_now() -> ! {
+        info!("Rebooting into SD reader mode");
+        system::reboot_to_reader()
+    }
+
     /// Cycle the volume 0 -> 1 -> 2 -> 3 -> 0.
     fn cycle_volume(&mut self) {
         let volume = (sound::volume() + 1) % (sound::MAX_VOLUME + 1);
@@ -952,6 +994,11 @@ impl App {
                 }
             }
             "newimg" => self.start_create(),
+            "reader" => self.enter_reader(),
+            "perf" => match arg {
+                "reset" => usb::perf::PERF.reset(),
+                _ => usb::perf::PERF.log(),
+            },
             "snd" => info!(
                 "volume {} / realistic speed {} / audio underruns {}",
                 sound::volume(),

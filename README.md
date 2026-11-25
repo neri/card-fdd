@@ -10,6 +10,8 @@ Tested on the Cardputer v1.1 and the Cardputer-Adv. The firmware detects the mod
 2. Build and flash (see below).
 3. Connect to the PC, press `Tab`, pick an image, and press `Enter`.
 
+To copy images onto the card without removing it, use SD reader mode: press `Ctrl+Alt+S`, and the device restarts and appears on the PC as a removable disk containing the whole card. Eject it on the PC, then press `Esc` (or `` ` ``) to restart into floppy mode. FAT32 with large clusters (32 KB, for example) makes the PC mount the card much faster in this mode.
+
 ## Keys
 
 | Key | Action |
@@ -20,6 +22,7 @@ Tested on the Cardputer v1.1 and the Cardputer-Adv. The firmware detects the mod
 | `e` / `w` | Eject (press twice to force) / toggle write protection |
 | `s` / `r` | Volume / realistic speed mode |
 | `n` / `i` | Create a blank image / show boot sector info |
+| `Ctrl+Alt+S` | Restart into SD reader mode (`Esc` or `` ` `` returns to floppy mode) |
 | `Ctrl+Alt+D` / `Ctrl+Alt+R` | Reboot into download mode / reboot |
 
 ## Configuration
@@ -67,7 +70,7 @@ To skip model detection, add `--features board-v1` or `--features board-adv`. En
 
 ## Known issues
 
-- The default VID/PID (`1209:0001`) is for testing only.
+- The default VID/PID (`1209:0001`) and the SD reader mode VID/PID (`1209:0002`) are for testing only.
 - The battery level on the screen may jump up and down or read too high, especially while USB is connected.
 
 See [docs/](docs/) (Japanese) for design details.

@@ -1,6 +1,6 @@
 # card-fdd 設計書
 
-M5Stack Cardputer v1.1 を USB フロッピードライブとして動かすファームウェアの、現時点（2026-11-22、Phase 0〜7 実装済み）の仕様と設計をまとめる。
+M5Stack Cardputer v1.1 を USB フロッピードライブとして動かすファームウェアの、現時点（2026-11-26。Phase 0〜7 と SD リーダーモードを実装済み）の仕様と設計をまとめる。
 要件・決定事項・開発の経緯は [PLAN.md](PLAN.md) を参照。この文書は「今の実装がどうなっているか」を記す。
 
 ---
@@ -24,12 +24,13 @@ M5Stack Cardputer v1.1 を USB フロッピードライブとして動かすフ�
 - 本体だけで、フォーマット済みの空の 1.44MB イメージを作れる
 - アクセス音（ステップ音、ディスクがこすれる音、挿入・取り出しの電子音）と、実機並みの速度に落とすモード
 - 設定は SD のルートの `CARDFDD.CFG` に保存する
+- SD リーダーモード: `Ctrl+Alt+S` で再起動すると、SD カード全体を普通のリムーバブルディスクとして PC に見せる。PC からイメージを置くときに SD を抜かなくてよい（[SD_READER_PLAN.md](SD_READER_PLAN.md)）
 
 ### 1.2 対応していないこと
 
 - 1.44MB 以外のフォーマット（720K / 1.2M / 1.25M / 2.88M は判定のみで挿入できない）
 - ヘッダ付きのイメージ形式（.d88 / .fdi / .hdm など）、exFAT の SD、日本語ファイル名の表示
-- SD リーダーモード、自動消灯（実装したが外した）
+- 自動消灯（実装したが外した）
 - Cardputer-Adv は画面表示、SD の操作、全キー、音と音量、USB での読み書き、LED、ダウンロードモードを実機で確認した。電池残量は未確認（[ADV_PLAN.md](ADV_PLAN.md) 10 章）
 
 ---
@@ -67,6 +68,7 @@ src/
 ├── bin/main.rs        初期化、タスクの起動、メインループ
 ├── lib.rs
 ├── app.rs             UI のアプリケーション層（画面、キー操作、挿入・取り出し、設定の保存、空イメージの作成、開発用コマンド）
+├── reader.rs          SD リーダーモードのキー操作と画面の更新（App の代わりに動く）
 ├── config.rs          設定ファイル CARDFDD.CFG の解析と書き出し（ハードウェア非依存）
 ├── input.rs           キー配列、修飾キー、KeyEvent（ハードウェア非依存）
 ├── logger.rs          ログ（UART / USB-Serial-JTAG / CDC）
@@ -77,14 +79,15 @@ src/
 │   ├── display.rs     ST7789 の初期化
 │   ├── led.rs         RGB LED
 │   ├── sdcard.rs      SD の SPI（速度の切り替え、抜き差し後の再初期化）
-│   ├── system.rs      再起動、ダウンロードモードで再起動
+│   ├── system.rs      再起動、ダウンロードモード / SD リーダーモードで再起動（リーダーモードのフラグ）
 │   ├── v1/            v1.1 固有: keyboard.rs（マトリクス）
 │   └── adv/           Adv 固有: keyboard.rs（TCA8418）, codec.rs（ES8311 の初期設定）
 ├── storage/           ストレージ層
-│   ├── mod.rs         Disk trait、SharedDisk、DiskError
+│   ├── mod.rs         Disk trait、Capacity、SharedDisk、DiskError
 │   ├── browser.rs     SD のフォルダ一覧（embedded-sdmmc）、ルートのファイルの読み書き、ファイルの作成
 │   ├── fat.rs         MBR と第 1 パーティションの BPB の解析、クラスタチェーン → 連続範囲（ハードウェア非依存）
 │   ├── image.rs       ImageDisk: イメージを USB に見せる。SD の物理ブロックに直接読み書き
+│   ├── reader.rs      ReaderDisk: SD カード全体を USB に見せる（SD リーダーモード）
 │   ├── geometry.rs    サイズ → フォーマット（ハードウェア非依存）
 │   ├── bootsector.rs  FAT ブートセクタの簡易解析（ハードウェア非依存）
 │   └── ramdisk.rs     空の 1.44MB FAT12 の生成（空イメージの作成と、開発用の仮想フロッピー）
@@ -92,6 +95,7 @@ src/
 │   ├── mod.rs         デバイスの組み立て、UsbMode、HOST（共有状態）、IN データの破棄など OTG のレジスタ操作
 │   ├── command.rs     UFI / SCSI コマンドの処理、センスデータ、HostState、診断カウンタ（ハードウェア非依存）
 │   ├── transfer.rs    データフェーズ（BOT / CBI 共通）、音のイベント、実機速度モード
+│   ├── perf.rs        読み書きの時間の計測（SD と USB の内訳。開発用コマンド perf）
 │   ├── cbi.rs         CBI 転送（ADSC + Bulk + Interrupt）
 │   ├── control_status.rs  MSC の処理結果を待って ADSC のステータス段を返す
 │   ├── sense_trace.rs     REQUEST SENSE の送信状態を読み取る診断
@@ -103,7 +107,8 @@ src/
 └── ui/
     ├── mod.rs         描画の共通処理、色
     ├── status.rs      ステータス画面
-    └── selector.rs    セレクター
+    ├── selector.rs    セレクター
+    └── reader.rs      SD リーダーモードの画面
 tools/
 ├── flash.sh           cargo run のランナー（書き込み → ダウンロードモード解除 → ログ表示）
 ├── clear-download-boot.py  FORCE_DOWNLOAD_BOOT を消して RTC ウォッチドッグでリセット
@@ -116,10 +121,10 @@ tools/
 
 | タスク | 役割 |
 |--------|------|
-| メイン（`main`） | 初期化のあと、キー入力・開発用コマンドの処理と `App::tick`（20ms ごと、空イメージ作成中は 5ms ごと）、電池電圧の読み取り（5 秒ごと） |
+| メイン（`main`） | 初期化のあと、キー入力・開発用コマンドの処理と `App::tick`（20ms ごと、空イメージ作成中は 5ms ごと）、電池電圧の読み取り（5 秒ごと）。SD リーダーモードでは `App` の代わりに `Reader::tick`（20ms ごと） |
 | `keyboard_task` | キーマトリクスをスキャンし、`KEY_EVENTS` チャネルに送る |
 | `usb_device_task` | embassy-usb の `UsbDevice::run`（列挙、制御転送） |
-| `msc_task` | マスストレージ（CBI または BOT）のコマンド処理 |
+| `msc_task` | マスストレージ（CBI または BOT）のコマンド処理。SD リーダーモードでは `reader_msc_task`（ディスクの型が違うだけ） |
 | `sound_task` | 音の合成と I2S への出力 |
 | `cdc_task` | 開発用 CDC（feature `dev-cdc` のときだけ） |
 
@@ -129,6 +134,7 @@ tools/
 |------|----|--------|
 | SD カード | `&'static RefCell<Browser<SdCard>>`（`SharedSd`） | UI（一覧、設定ファイル、空イメージ）と USB（ImageDisk 経由で生ブロック） |
 | 挿入中のイメージ | `&'static RefCell<ImageDisk<SharedSd>>` | UI（挿入・取り出し・書き込み禁止）と USB（`SharedDisk` 経由で読み書き） |
+| カード全体（SD リーダーモードのみ） | `&'static RefCell<ReaderDisk<SdCard>>`（`SdReader`） | USB（`SharedDisk` 経由で読み書き）と UI（状態の表示、ホストからの取り出し）。このモードでは `Browser` も `App` も作らない |
 | ホストとの状態 | `usb::HOST: HostState`（アトミック） | USB が書き、UI が読む（取り出し禁止、イジェクト要求、転送中、接続状態、診断） |
 | アクセスの通知 | `usb::ACTIVITY: Signal` | USB → UI（LED、アクセス位置の表示） |
 | 音のイベント | `sound::post` / `take_event`（チャネル） | USB・UI → 音 |
@@ -139,9 +145,9 @@ tools/
 
 ### 3.4 起動の順番
 
-1. ロガー（UART1）、タイマー、esp-rtos
+1. ロガー（UART1）、タイマー、esp-rtos。SD リーダーモードのフラグを読んで消す（`board::system::take_reader_request`）
 2. 液晶、RGB LED、電池の ADC、キーボード（`keyboard_task` を起動）、音（`sound_task` を起動）
-3. SD を初期化し、`App::mount_card` で設定ファイルを読み、イメージフォルダを開く
+3. SD の SPI を用意する。フラグがあれば SD リーダーモードへ分岐する（6.5 節。ここから先は通らない）。なければ `App::mount_card` で設定ファイルを読み、イメージフォルダを開く
 4. 設定の内容（方式、VID/PID、製品名）で USB を組み立てて起動する。ここから USB-Serial-JTAG は使えなくなる
 5. `App::auto_insert` で前回のイメージを挿入する
 6. メインループ
@@ -195,9 +201,26 @@ tools/
 
 ### 4.5 ディスクの抽象化
 
-`storage::Disk` trait（`geometry` / `write_protected` / `media_generation` / `read` / `write`）を USB 側が使う。
+`storage::Disk` trait を USB 側が使う。
+
+| メソッド | 内容 |
+|---------|------|
+| `geometry` | フロッピーのジオメトリ（CHS）。媒体がないか、CHS を持たない媒体（カード全体）なら `None`。MODE SENSE の Flexible Disk Page、FORMAT UNIT、音と実機速度モードに使う |
+| `capacity` | ブロック数とブロック長（`Capacity`）。既定はジオメトリから計算する。READ CAPACITY、READ FORMAT CAPACITIES、読み書きの範囲の確認とブロック長に使う |
+| `write_protected` / `media_generation` | 書き込み禁止 / 媒体の世代番号 |
+| `read` / `write` | 1 セクタの読み書き |
+| `max_read_blocks` / `read_blocks`、`max_write_blocks` / `write_blocks` | 連続した複数セクタの読み書き。既定は 1 セクタずつ（`max_*_blocks` = 1）で、`ImageDisk` はこのまま。`ReaderDisk` は 8 ブロックずつ SD のマルチブロック読み書きにする |
+
 `media_generation` は挿入・取り出し・書き込み禁止の切り替え（挿入中）のたびに変わり、USB 側はこれでメディア交換を知る。
 `SharedDisk` は `RefCell` に入った Disk を呼び出しのたびに借用するラッパー。
+
+### 4.6 カード全体へのアクセス（`storage::reader`、SD リーダーモード）
+
+- `ReaderDisk` はカード（embedded-sdmmc の `BlockDevice`）を直接持つ。LBA はカードのブロック番号そのもの（MBR を含む）で、ファイルシステムには触らない
+- 容量は起動時に `SdCard::num_bytes()` から求める（32 ビットの LBA に収まるよう切り詰める）
+- 読み書きは最大 8 ブロック（4KB）ずつ、マルチブロック読み出し（CMD18）/ マルチブロック書き込み（ACMD23 で事前消去を指定してから CMD25）で行う。書き込みはコマンドをまたいで溜めない（ライトスルー）
+- 状態は「使える / 取り出し済み / エラー」の 3 つ。ホストからの取り出し（START STOP UNIT）で取り出し済みに、SD の読み書きの失敗（起動時にカードが読めない場合も）でエラーになり、どちらも以降は媒体なしを返す。元に戻すには通常モードへ戻る（再起動する）
+- 書き込み禁止はない（`write_protected` は常に false）
 
 ---
 
@@ -213,6 +236,8 @@ tools/
 
 **Windows でフロッピー（A:）として使う条件**（Phase 3 で判明）: UFI + CBI であること、VID/PID が Windows の usbstor.inf に載っている既知の USB フロッピーのもの（例: TEAC `0644:0000`）であること、インターフェースが 1 つだけであること（CDC 付きだと開始に失敗する）。Linux はどの方式でも使える。
 
+SD リーダーモードは設定にかかわらず `scsi`（08 / 06 / 50）で、VID/PID は `1209:0002`（pid.codes のテスト用）、製品名 `SD Reader`、シリアル番号 `CARDSD0001`、INQUIRY の製品 `SD Reader` に固定する（`UsbIdentity::READER`）。フロッピー用の ID と分けるのは、通常モードを TEAC の ID にしていても Windows が別のデバイスとして扱うようにするため。
+
 ディスクリプタ: 最大消費電流 100mA、EP0 は 64 バイト（その他は embassy-usb の既定値）。VID/PID・製造者名・製品名は設定ファイルで変えられる（既定は pid.codes のテスト用 `1209:0001`、`card-fdd` / `USB Floppy`）。シリアル番号は `CARDFDD0001`。開発用 CDC 付きのときは IAD を使う複合デバイス（device class EF/02/01）。
 
 ### 5.2 コマンド処理（`usb::command::Processor`）
@@ -224,7 +249,7 @@ tools/
 | 03 | REQUEST SENSE | センスデータ 18 バイト（固定形式）。返したらセンスを消す |
 | 04 | FORMAT UNIT（UFI のみ） | パラメータリストを受け取り、指定トラック（または全体）を 0xF6 で埋める |
 | 08 / 0A | READ(6) / WRITE(6)（SCSI のみ） | |
-| 12 | INQUIRY | 36 バイト。リムーバブル。ベンダー `CARDFDD`、製品 `USB Floppy`、版 `0.1` |
+| 12 | INQUIRY | 36 バイト。リムーバブル。ベンダー `CARDFDD`、製品 `USB Floppy`（SD リーダーモードでは `SD Reader`）、版 `0.1` |
 | 15 / 55 | MODE SELECT(6/10) | 受け取って無視する |
 | 1A / 5A | MODE SENSE(6/10) | WP ビット。UFI では媒体種別（1.44M = 0x94）と Flexible Disk Page（0x05） |
 | 1B | START STOP UNIT | LoEj かつ Start=0 ならイジェクト要求として UI に伝える |
@@ -242,7 +267,10 @@ tools/
 
 ### 5.3 データフェーズ（`usb::transfer::DataPipe`）
 
-- 処理器が返す `DataPhase`（なし / In / Out / Read / Write）に従って、Bulk で転送する。セクタ単位で SD を読み書きしながら 64 バイトのパケットに分けて送受信する
+- 処理器が返す `DataPhase`（なし / In / Out / Read / Write）に従って、Bulk で転送する。SD を読み書きしながら 64 バイトのパケットに分けて送受信する
+- 1 回に読み書きするのは `Disk::max_read_blocks` / `max_write_blocks` のセクタ数（作業バッファ 4KB に収まる範囲）。フロッピーは 1 セクタずつ、SD リーダーモードは 8 ブロックずつ。書き込みは 1 回分を USB から受け取ってから SD に書く。SD と USB は順番に処理し、重ねない
+- 作業バッファ（4KB + 64 バイト）は `ConstStaticCell` で静的に置く（4KB をスタックに載せないため）
+- 読み書きのたびに、SD の時間と USB の時間を `usb::perf::PERF` に足し込む（開発用コマンド `perf`）
 - ホストが想定する転送量（BOT は CBW、CBI はコマンドから計算した `expected_transfer`）より少なく送ったときは、短いパケット（必要なら長さ 0）で終わりを示す。ホストが送ってくる量が多いときは読み捨てる
 - Out / Write でホストから届くデータがコマンドに必要な量より少ないとき（短いパケットで途中で終わった、ホストの想定転送量が足りない、転送方向が In）は、そのコマンドを失敗にしてデータフェーズエラー（0B/4B/00）を返す。書き込みは受け取れたセクタまで行う。短いパケットでデータフェーズが終わったら、それ以上は読み捨てない（次の CBW を取り込まないため）
 - データフェーズの間は `HOST.busy` を立てる（UI はこの間に取り出さない）
@@ -265,12 +293,14 @@ CBW（31 バイト、署名 USBC）を受け、データフェーズのあと CS
 - 起動時: USB-Serial-JTAG の D+ プルアップを外して 200ms 待ち、ホストに切断を見せてから OTG を初期化する。初期化後は JTAG 側のプルアップ・プルダウンをすべて外す
 - 再起動の前（通常の再起動、ダウンロードモードへの再起動）: OTG 側のプルアップを外して 200ms 待ち、PHY の選択（RTC）を JTAG に戻し、JTAG のプルアップの上書きを解除する。PHY の選択とプルアップの設定はソフトウェアリセットでは戻らないため
 - ダウンロードモードへの再起動は `RTC_CNTL_OPTION1.FORCE_DOWNLOAD_BOOT` を立ててソフトウェアリセットする。このビットはリセットで消えないので、書き込み後に `tools/clear-download-boot.py` で消す
+- SD リーダーモードへの再起動は `RTC_CNTL_STORE0` にマジックナンバー（`0x53445244`）を書いてから通常の再起動をする。STORE0 はソフトウェアリセットでは消えず、電源を切ると消える。esp-hal と ESP-IDF のブートローダーは STORE0 を使わない（STORE1〜7 は使う）。起動時に読んだらすぐ 0 に戻すので、リーダーモードは 1 回の起動だけで、次に再起動すると通常モードに戻る
 
 ### 5.7 開発用 CDC-ACM（feature `dev-cdc`、既定では無効）
 
 - ログを送る。ポートが閉じている間（DTR が落ちている間）は送らずにパイプ（4KB）にためておき、DTR が 300ms 続けて立ってから送る（ModemManager などが一瞬だけ開いたときに起動ログを取られないように）。パイプがいっぱいになると新しい行を捨てるので、起動直後のログは最初にポートを開いた側に届く。送信が 1 秒終わらなければ接続待ちからやり直す
 - 1 行のコマンドを受ける。`download`（ダウンロードモードで再起動）、`reboot` は CDC タスクが処理し、それ以外は UI に渡す
-- UI が処理するコマンド: `ls`、`insert <名前>`、`eject`、`wp on|off`、`newimg`、`stats`（USB の診断）、`snd`（音の状態）、`cfg`（設定の表示）、`key tab|enter|esc|<1 文字>`（キー入力の代わり）
+- UI が処理するコマンド: `ls`、`insert <名前>`、`eject`、`wp on|off`、`newimg`、`reader`（SD リーダーモードへ。`Ctrl+Alt+S` と同じ）、`perf`（読み書きの時間の内訳）/ `perf reset`、`stats`（USB の診断）、`snd`（音の状態）、`cfg`（設定の表示）、`key tab|enter|esc|<1 文字>`（キー入力の代わり）
+- SD リーダーモードで処理するコマンド: `exit`（`Esc` と同じ）、`perf` / `perf reset`
 - ホストの端末がログを送り返してくることがあるので、`[` で始まる行は無視し、200ms 以上途切れたら書きかけの行を捨てる
 
 ---
@@ -319,6 +349,7 @@ CBW（31 バイト、署名 USBC）を受け、データフェーズのあと CS
 | u | USB の診断パネルの表示 / 非表示 |
 | Ctrl+Alt+D | ダウンロードモードで再起動 |
 | Ctrl+Alt+R | 再起動 |
+| Ctrl+Alt+S | SD リーダーモードで再起動（6.5 節）。転送中なら終わってから。ホストがイメージの取り出しを禁止していたら警告し、3 秒以内にもう一度押すと進む |
 
 | キー | ステータス画面 | セレクター |
 |------|---------------|-----------|
@@ -339,7 +370,31 @@ SD を読めないときは、どちらの画面でもエラーを表示し、En
 ### 6.4 RGB LED
 
 - 緑: 本体が SD を読み書きしている（一覧、挿入、設定の保存、空イメージの作成）
-- 橙: USB からの読み書き（最後のアクセスから 80ms で消える）
+- 橙: USB からの読み書き（最後のアクセスから 80ms で消える）。SD リーダーモードでも同じ
+
+### 6.5 SD リーダーモード（`reader`, `ui::reader`）
+
+```
+ SD READER       USB:PC               87%     ← USB の状態、電池
+ ────────────────────────────────────────
+ Card: 8.0 GB                                 ← カードの容量（10 進の GB / MB）
+
+ Ready. The PC can use the whole card.        ← 状態（Ready / Ejected by the PC. / SD card error.）
+ Eject it on the PC before leaving.
+
+ Keep FAT16/FAT32 + MBR for floppies.
+ ────────────────────────────────────────
+ Esc or `: back to floppy mode                ← 警告もここに出す
+```
+
+| キー | 動作 |
+|------|------|
+| Esc（Fn+`` ` ``）/ `` ` `` | 通常モードへ戻る（再起動）。ホストが取り出し済み・カードのエラー・USB 未接続ならすぐ戻る。それ以外は警告を出し、3 秒以内にもう一度押すと戻る。転送中なら終わってから |
+| Ctrl+Alt+D / Ctrl+Alt+R | ダウンロードモードで再起動 / 再起動 |
+
+- ほかのキーは受け付けない。本体はこのモードの間、SD のファイルシステムに一切触らない（設定ファイルも読まない）
+- 挿入中だったイメージは取り出さずに再起動する（挿入しても FAT は変わらず、書き込みは SD に直接届いているため）。設定の `last_image` も残るので、通常モードに戻ると自動で挿入される
+- キーマトリクスにダイオードがないため、Ctrl・Alt・S を同時に押すと Shift も押されたように読め、文字は `'S'` になる。`'s'` と `'S'` の両方を受け付ける
 
 ---
 
@@ -377,7 +432,7 @@ SD を読めないときは、どちらの画面でもエラーを表示し、En
 
 ## 8. 設定ファイル（`CARDFDD.CFG`）
 
-SD のルートに置く。`key=value`、`#` から行末はコメント、知らないキーは無視する。ファイルがなければ既定値で動き、挿入・取り出し・書き込み禁止・音量・実機速度モードの変更のたびに保存する（書き直す）。
+SD のルートに置く（SD リーダーモードでは読まない）。`key=value`、`#` から行末はコメント、知らないキーは無視する。ファイルがなければ既定値で動き、挿入・取り出し・書き込み禁止・音量・実機速度モードの変更のたびに保存する（書き直す）。
 
 | キー | 既定値 | 内容 |
 |------|--------|------|
@@ -443,11 +498,15 @@ Windows でフロッピーとして使うときは、CDC なし（既定）で�
 
 | 項目 | 値 |
 |------|----|
-| 読み出し | 約 440KB/s（1.44MB 全体で約 3.3 秒） |
-| 書き込み | 約 120KB/s（1 セクタずつ SD に書くため） |
+| 読み出し（フロッピー） | 約 440KB/s（1.44MB 全体で約 3.3 秒） |
+| 書き込み（フロッピー） | 約 120KB/s（1 セクタずつ SD に書くため） |
+| 読み出し（SD リーダーモード） | 約 470KB/s（データフェーズ。1 ブロックあたり SD 約 390µs + USB 約 670µs） |
+| 書き込み（SD リーダーモード） | 約 300KB/s（データフェーズ。1 ブロックあたり SD 約 630µs + USB 約 1,000µs） |
 | 列挙 | 約 60ms（設定から最初のコマンドまで 1ms 程度） |
-| ファームのサイズ | 約 200KB（Flash 8MB 中） |
-| 主な RAM | SD の一覧 128 項目、音の DMA 16KB、空イメージ用 4KB、USB の作業バッファ 約 1KB × 2 |
+| ファームのサイズ | 約 330KB（Flash 8MB 中） |
+| 主な RAM | SD の一覧 128 項目、音の DMA 16KB、空イメージ用 4KB、USB の作業バッファ 約 4KB（静的）、SD リーダーモードのブロックバッファ 4KB |
+
+USB は Synopsys ドライバが 64 バイトのパケットを 1 個ずつしか送受信できず、1 パケットあたり 80〜130µs かかる。SD と USB を重ねない限り、これ以上は速くならない（SD_READER_PLAN.md 14.7〜14.8 節）。
 
 ---
 
@@ -456,5 +515,7 @@ Windows でフロッピーとして使うときは、CDC なし（既定）で�
 - 開発用 CDC 付きのビルドに Windows 用の VID/PID を設定すると、Windows では開始に失敗する
 - 書き込み中に電源が切れたときの動作、使用中の SD の抜き差し、断片化したイメージファイル、非 ASCII のファイル名は未確認（PLAN.md 9 章）
 - サスペンド中の消費電流の規定、申告した消費電流（100mA）は守れていない可能性がある
-- 既定の VID/PID（pid.codes のテスト用）は配布には使えない
+- 既定の VID/PID と SD リーダーモードの VID/PID（どちらも pid.codes のテスト用）は配布には使えない
+- SD リーダーモードは Linux と Windows（通常モードの TEAC の ID との行き来を含む）、v1.1 と Adv の両方で確かめた。使用中のカードの抜き取りと、フロッピーの挿入中・転送中に入ることは未確認（SD_READER_PLAN.md 11 章）
+- SD リーダーモードで、クラスタ 4KB の FAT32 のカードは、マウントのたびに PC が FAT 全体（8GB のカードで約 8MB）を読むので 15 秒ほどかかる。クラスタの大きい FAT32（32KB など）でフォーマットすると FAT が小さくなって速い
 - 音色は調整を保留中

@@ -20,6 +20,7 @@ pub mod cbi;
 pub mod cdc;
 pub mod command;
 mod control_status;
+pub mod perf;
 pub(crate) mod sense_trace;
 pub mod transfer;
 
@@ -77,6 +78,17 @@ impl UsbIdentity {
         manufacturer: "card-fdd",
         product: "USB Floppy",
         serial: "CARDFDD0001",
+    };
+
+    /// SD reader mode. Fixed (not configurable), and different from the floppy IDs so the host
+    /// never mixes up the two devices. 1209:0002 is a pid.codes test PID: fine for private testing only,
+    /// not for devices that are redistributed.
+    pub const READER: UsbIdentity = UsbIdentity {
+        vid: 0x1209,
+        pid: 0x0002,
+        manufacturer: "card-fdd",
+        product: "SD Reader",
+        serial: "CARDSD0001",
     };
 }
 
